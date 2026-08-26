@@ -14,6 +14,8 @@
 //! which constructs its own DB-shaped settings type and converts it to
 //! `EngineSettings` right before calling [`step`].
 
+use std::collections::HashMap;
+
 use nalgebra::{DMatrix, DVector};
 use rand::Rng;
 use serde::Deserialize;
@@ -80,6 +82,13 @@ pub struct PlaygroundSettingsInput {
     pub prior_mean: Option<Vec<f64>>,
     pub prior_cov_diag: Option<Vec<f64>>,
     pub eap_quadrature_points: Option<i32>,
+    /// Subset (and order) of the bank's dimension universe to actually test — mirrors
+    /// `TestSettings.tested_dimensions` in production. `None` defaults to the bank's
+    /// full universe (today's playground behavior). Inert here: this struct is just
+    /// override data for the host application's `build_settings`; no function in this
+    /// crate reads it directly — see `step`'s `tested_a` parameter for how masking
+    /// actually happens once this has been resolved into a concrete dimension list.
+    pub tested_dimensions: Option<Vec<String>>,
 }
 
 /// Simulate a dichotomous response from a "true theta" using the item's own
@@ -127,6 +136,16 @@ fn find_item<'a>(items: &'a [EngineItem], item_id: &str) -> EngineResult<&'a Eng
 /// produce/estimate a response, optionally evaluate the stopping rule —
 /// exactly mirroring the production `McatEngine` calls used by
 /// `session_handler`, just without any database access.
+///
+/// `tested_a` maps item id → that item's a-vector already projected into the caller's
+/// tested-dimension order (built by `mcat-api`'s `playground::service::build_projected_a`
+/// via `mcat_engine::dimensions::project_item`, once per request — this crate stays
+/// dimension-name-free and never computes projections itself, only consumes them). An
+/// item id absent from this map doesn't project onto the current tested-dimension set:
+/// it's silently excluded from selection candidates (mirrors production's "excluded
+/// entirely" eligibility rule), and it's an `EngineError::InvalidRequest` if it turns up
+/// in `administered` or as `item_override` — `administered` is caller-resent, in-flight
+/// state that can legitimately go stale if `tested_dimensions` changed between calls.
 #[allow(clippy::too_many_arguments)]
 pub fn step(
     items: &[EngineItem],
@@ -135,6 +154,7 @@ pub fn step(
     theta: &DVector<f64>,
     cum_fim: &DMatrix<f64>,
     administered: &[AdministeredItem],
+    tested_a: &HashMap<String, DVector<f64>>,
     k: usize,
     item_override: Option<&str>,
     response_source: ResponseSource,
@@ -142,12 +162,11 @@ pub fn step(
 ) -> EngineResult<StepOutcome> {
     let administered_ids: Vec<String> = administered.iter().map(|a| a.item_id.clone()).collect();
 
-    // Playground always tests the bank's full dimension universe (see the
-    // host application's `build_settings`), so each item's a_params is
-    // already in the right order — no masking/projection needed, just pairing.
+    // Items absent from `tested_a` measure a dimension outside the current
+    // tested-dimension set and are excluded entirely — never truncated/zero-padded.
     let candidates: Vec<(&EngineItem, DVector<f64>)> = items
         .iter()
-        .map(|it| (it, DVector::from_vec(it.a_params.clone())))
+        .filter_map(|it| tested_a.get(&it.id).map(|a| (it, a.clone())))
         .collect();
 
     let (item_idx, selection_score, selection_debug) = if stages.selection {
@@ -160,7 +179,20 @@ pub fn step(
             k,
         )?;
         match best {
-            Some((idx, score)) => (Some(idx), Some(score), Some(debug)),
+            Some((cand_idx, score)) => {
+                // `cand_idx` indexes into `candidates`, which — now that it's built via
+                // `filter_map` — is no longer 1:1 with `items` whenever any item was
+                // excluded by `tested_a`. Re-resolve the winning candidate's position in
+                // the original `items` slice by id, since `StepOutcome.item_idx` is
+                // documented (and relied on by callers, e.g. `mcat-api`'s
+                // `shape_step_response`) as an index into `items`, not `candidates`.
+                let item_id = &candidates[cand_idx].0.id;
+                let idx = items
+                    .iter()
+                    .position(|it| &it.id == item_id)
+                    .expect("a selected candidate always originates from `items`");
+                (Some(idx), Some(score), Some(debug))
+            }
             None => {
                 // Bank exhausted — nothing was administered this step, so no fresh EAP
                 // posterior SD is available either; `compute_se` falls back to the
@@ -198,20 +230,25 @@ pub fn step(
     };
 
     let item = &items[item_idx.expect("item_idx resolved above")];
+    // Only reachable via `item_id_override` — normal selection only ever picks from
+    // `tested_a`-backed candidates above, so this can't fail on that path.
+    let item_a = tested_a.get(&item.id).ok_or_else(|| {
+        EngineError::InvalidRequest(format!(
+            "Item '{}' does not project onto the current tested-dimension set",
+            item.id
+        ))
+    })?;
 
     let response = if stages.estimation {
         match response_source {
             ResponseSource::Fixed(r) => Some(r),
-            ResponseSource::Simulate { true_theta } => {
-                let a = DVector::from_vec(item.a_params.clone());
-                Some(simulate_response(
-                    true_theta,
-                    &a,
-                    item.d_param,
-                    item.c_param,
-                    rng,
-                ))
-            }
+            ResponseSource::Simulate { true_theta } => Some(simulate_response(
+                true_theta,
+                item_a,
+                item.d_param,
+                item.c_param,
+                rng,
+            )),
             ResponseSource::None => {
                 return Err(EngineError::InvalidRequest(
                     "estimation is enabled but no response source (true_theta or response_override) was provided".into(),
@@ -233,12 +270,20 @@ pub fn step(
                 continue;
             };
             let prior_item = find_item(items, &prior.item_id)?;
-            all_a.push(DVector::from_vec(prior_item.a_params.clone()));
+            let prior_a = tested_a.get(&prior.item_id).ok_or_else(|| {
+                EngineError::InvalidRequest(format!(
+                    "Previously administered item '{}' no longer projects onto the current \
+                     tested-dimension set — tested_dimensions must stay consistent across \
+                     playground calls that resend the same in-flight state",
+                    prior.item_id
+                ))
+            })?;
+            all_a.push(prior_a.clone());
             all_d.push(prior_item.d_param);
             all_c.push(prior_item.c_param);
             all_r.push(prior_response);
         }
-        all_a.push(DVector::from_vec(item.a_params.clone()));
+        all_a.push(item_a.clone());
         all_d.push(item.d_param);
         all_c.push(item.c_param);
         all_r.push(resp);
@@ -250,8 +295,7 @@ pub fn step(
         (theta.clone(), None)
     };
 
-    let a_new = DVector::from_vec(item.a_params.clone());
-    let cum_fim_after = cum_fim + item_fim(&theta_after, &a_new, item.d_param, item.c_param);
+    let cum_fim_after = cum_fim + item_fim(&theta_after, item_a, item.d_param, item.c_param);
     // Method-appropriate SE, exactly mirroring session_handler::submit_response.
     let se_after = McatEngine::compute_se(
         settings,
@@ -313,12 +357,18 @@ pub struct ExamineeRunOutcome {
 /// non-trivial per-step payload by N for no caller benefit. Callers that need the full
 /// per-step trace for a single examinee should call `step()` directly in their own loop
 /// instead (see `mcat-api`'s `modules::playground::service::run`), not this function.
+///
+/// `tested_a` is `step`'s own tested-dimension-projection map, reused unchanged for
+/// every step of this one examinee — since every administered item was itself drawn
+/// from candidates `step` already filtered through this same map, its "administered
+/// item missing from tested_a" error case is structurally unreachable here.
 #[allow(clippy::too_many_arguments)]
 pub fn run_examinee(
     items: &[EngineItem],
     settings: &EngineSettings,
     initial_theta: &DVector<f64>,
     true_theta: &DVector<f64>,
+    tested_a: &HashMap<String, DVector<f64>>,
     k: usize,
     max_steps: usize,
     rng: &mut impl Rng,
@@ -338,6 +388,7 @@ pub fn run_examinee(
             &theta,
             &cum_fim,
             &administered,
+            tested_a,
             k,
             None,
             ResponseSource::Simulate { true_theta },
@@ -430,6 +481,17 @@ mod tests {
             .collect()
     }
 
+    /// Identity `tested_a`: every item's own `a_params`, unprojected — models the
+    /// "tested_dimensions omitted" default (tested set == bank universe) that all the
+    /// pre-masking tests below exercise, so they keep passing unchanged now that `step`/
+    /// `run_examinee` require a `tested_a` map instead of reading `a_params` directly.
+    fn identity_tested_a(items: &[EngineItem]) -> HashMap<String, DVector<f64>> {
+        items
+            .iter()
+            .map(|it| (it.id.clone(), DVector::from_vec(it.a_params.clone())))
+            .collect()
+    }
+
     #[test]
     fn run_examinee_recovers_a_known_true_theta_given_enough_items() {
         let items = wide_bank(41);
@@ -438,8 +500,18 @@ mod tests {
         let initial_theta = DVector::from_vec(vec![0.0]);
         let mut rng = StdRng::seed_from_u64(42);
 
-        let outcome =
-            run_examinee(&items, &s, &initial_theta, &true_theta, 1, 20, &mut rng).unwrap();
+        let tested_a = identity_tested_a(&items);
+        let outcome = run_examinee(
+            &items,
+            &s,
+            &initial_theta,
+            &true_theta,
+            &tested_a,
+            1,
+            20,
+            &mut rng,
+        )
+        .unwrap();
 
         assert_eq!(outcome.n_administered, 20);
         assert_eq!(outcome.administered_item_ids.len(), 20);
@@ -459,8 +531,18 @@ mod tests {
         let initial_theta = DVector::from_vec(vec![0.0]);
         let mut rng = StdRng::seed_from_u64(7);
 
-        let outcome =
-            run_examinee(&items, &s, &initial_theta, &true_theta, 1, 10, &mut rng).unwrap();
+        let tested_a = identity_tested_a(&items);
+        let outcome = run_examinee(
+            &items,
+            &s,
+            &initial_theta,
+            &true_theta,
+            &tested_a,
+            1,
+            10,
+            &mut rng,
+        )
+        .unwrap();
 
         assert_eq!(outcome.n_administered, 2);
         assert_eq!(outcome.stop_reason.as_deref(), Some("bank_exhausted"));
@@ -476,11 +558,154 @@ mod tests {
         let initial_theta = DVector::from_vec(vec![0.0]);
         let mut rng = StdRng::seed_from_u64(3);
 
-        let outcome =
-            run_examinee(&items, &s, &initial_theta, &true_theta, 1, 3, &mut rng).unwrap();
+        let tested_a = identity_tested_a(&items);
+        let outcome = run_examinee(
+            &items,
+            &s,
+            &initial_theta,
+            &true_theta,
+            &tested_a,
+            1,
+            3,
+            &mut rng,
+        )
+        .unwrap();
 
         assert_eq!(outcome.n_administered, 3);
         assert_eq!(outcome.stop_reason, None);
+    }
+
+    #[test]
+    fn step_excludes_item_absent_from_tested_a_map() {
+        // "excluded" (d=0) is the perfect d_optimal target at theta=0 — it would win
+        // selection if eligible. Only "included" (a worse-targeted d=3) is in `tested_a`,
+        // proving exclusion isn't accidental (a coincidentally-worse score), it's absolute.
+        let excluded = EngineItem {
+            id: "excluded".to_string(),
+            a_params: vec![1.5],
+            d_param: 0.0,
+            c_param: 0.0,
+            sh_r_param: 1.0,
+            is_active: true,
+        };
+        let included = EngineItem {
+            id: "included".to_string(),
+            a_params: vec![1.5],
+            d_param: 3.0,
+            c_param: 0.0,
+            sh_r_param: 1.0,
+            is_active: true,
+        };
+        let items = vec![excluded, included];
+        let s = settings("fixed_length", 1, 10, 0.3);
+        let tested_a: HashMap<String, DVector<f64>> =
+            [("included".to_string(), DVector::from_vec(vec![1.5]))]
+                .into_iter()
+                .collect();
+        let stages = StageToggles::default();
+        let theta = DVector::from_vec(vec![0.0]);
+        let cum_fim = DMatrix::<f64>::zeros(1, 1);
+        let mut rng = StdRng::seed_from_u64(1);
+
+        let outcome = step(
+            &items,
+            &s,
+            &stages,
+            &theta,
+            &cum_fim,
+            &[],
+            &tested_a,
+            1,
+            None,
+            ResponseSource::Simulate { true_theta: &theta },
+            &mut rng,
+        )
+        .unwrap();
+
+        let idx = outcome.item_idx.expect("the eligible item should be found");
+        assert_eq!(items[idx].id, "included");
+    }
+
+    #[test]
+    fn step_returns_invalid_request_when_historical_administered_item_missing_from_tested_a() {
+        let items = wide_bank(3);
+        let mut tested_a = identity_tested_a(&items);
+        tested_a.remove("item-0"); // simulates tested_dimensions changing since it was administered
+        let administered = vec![AdministeredItem {
+            item_id: "item-0".to_string(),
+            response: Some(1),
+        }];
+        let s = settings("fixed_length", 1, 10, 0.3);
+        let stages = StageToggles {
+            selection: false,
+            estimation: true,
+            stopping: false,
+        };
+        let theta = DVector::from_vec(vec![0.0]);
+        let cum_fim = DMatrix::<f64>::zeros(1, 1);
+        let mut rng = StdRng::seed_from_u64(1);
+
+        let result = step(
+            &items,
+            &s,
+            &stages,
+            &theta,
+            &cum_fim,
+            &administered,
+            &tested_a,
+            1,
+            Some("item-1"), // present in tested_a — isolates the failure to the historical item
+            ResponseSource::Fixed(1),
+            &mut rng,
+        );
+
+        assert!(matches!(result, Err(EngineError::InvalidRequest(_))));
+    }
+
+    #[test]
+    fn step_uses_projected_a_not_raw_item_a_params() {
+        let items = vec![EngineItem {
+            id: "item-0".to_string(),
+            // Raw "universe order" a_params, deliberately different from tested_a below —
+            // if `step` ever fell back to reading this instead of the projected vector,
+            // the FIM assertion below would fail.
+            a_params: vec![1.0],
+            d_param: 0.0,
+            c_param: 0.0,
+            sh_r_param: 1.0,
+            is_active: true,
+        }];
+        let s = settings("fixed_length", 1, 10, 0.3);
+        let projected_a = DVector::from_vec(vec![2.0]);
+        let tested_a: HashMap<String, DVector<f64>> = [(items[0].id.clone(), projected_a.clone())]
+            .into_iter()
+            .collect();
+        let stages = StageToggles {
+            selection: false,
+            estimation: true,
+            stopping: false,
+        };
+        let theta = DVector::from_vec(vec![0.0]);
+        let cum_fim = DMatrix::<f64>::zeros(1, 1);
+        let mut rng = StdRng::seed_from_u64(1);
+
+        let outcome = step(
+            &items,
+            &s,
+            &stages,
+            &theta,
+            &cum_fim,
+            &[],
+            &tested_a,
+            1,
+            Some("item-0"),
+            ResponseSource::Fixed(1),
+            &mut rng,
+        )
+        .unwrap();
+
+        let expected_fim = item_fim(&outcome.theta_after, &projected_a, 0.0, 0.0);
+        assert_eq!(outcome.cum_fim_after, expected_fim);
     }
 
     #[test]
