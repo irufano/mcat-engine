@@ -55,3 +55,8 @@ per-app SSH/deploy-key access. See the "reuse across apps" discussion this
 crate came out of for the full reasoning (git dependency now vs. a private
 Cargo registry later, if/when the number of consuming apps grows enough to
 justify it).
+
+
+psrecord $(pgrep -f "target/release/mcat-api") --interval 1 --log mcat-usage.csv 
+
+cat mcat-usage.csv

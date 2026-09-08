@@ -17,7 +17,7 @@
 //! measure only dimensions the preset actually tests?) and, if eligible,
 //! re-indexes the item's a-vector into the preset's tested order.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Projects one item's bank-universe-order `a_params` into `tested_order`.
 ///
@@ -56,6 +56,35 @@ pub fn project_item(
         })
         .collect();
     Some(projected)
+}
+
+/// Sparse-map variant of `project_item`, for hosts whose per-item
+/// discrimination values are stored as a normalized junction (one row per
+/// measured dimension, e.g. `dimension_code -> a`) rather than a dense array
+/// positional to a fixed bank universe order — there is no `universe_order`/
+/// `item_a_universe` pair to reindex from, only the sparse map itself.
+///
+/// Eligibility and zero-fill rules are identical to `project_item`: `None`
+/// when the item measures a dimension outside `tested_order` (excluded
+/// entirely, never included with the extra dimension silently dropped);
+/// otherwise `Some(vec)` sized `tested_order.len()`, with `0.0` at any
+/// position `tested_order` covers but this item does not measure — a
+/// legitimate "not applicable" zero in the transient vector the engine's MIRT
+/// math requires, never itself persisted to storage.
+pub fn project_item_from_map(
+    item_measured: &HashMap<String, f64>,
+    tested_order: &[String],
+) -> Option<Vec<f64>> {
+    if item_measured.keys().any(|d| !tested_order.contains(d)) {
+        return None;
+    }
+
+    Some(
+        tested_order
+            .iter()
+            .map(|dim| item_measured.get(dim).copied().unwrap_or(0.0))
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -142,5 +171,42 @@ mod tests {
         let measured = set(&["verbal", "numeric", "reasoning"]);
         let got = project_item(&universe, &measured, &[1.5, 0.3, 0.4], &tested);
         assert_eq!(got, Some(vec![0.4, 1.5, 0.3]));
+    }
+
+    // ── project_item_from_map: sparse-map variant for v2's normalized junction
+    // storage (dimension_code -> a), no universe_order/item_a_universe pair. ──
+
+    fn map(pairs: &[(&str, f64)]) -> HashMap<String, f64> {
+        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    #[test]
+    fn one_dimensional_item_projects_into_single_slot_from_map() {
+        let got = project_item_from_map(&map(&[("verbal", 1.6)]), &strs(&TESTED));
+        assert_eq!(got, Some(vec![0.0, 1.6, 0.0])); // [spatial, verbal, numeric]
+    }
+
+    #[test]
+    fn two_dimensional_item_measuring_only_tested_dims_is_eligible_from_map() {
+        let got = project_item_from_map(
+            &map(&[("verbal", 1.2), ("spatial", 1.3)]),
+            &strs(&TESTED),
+        );
+        assert_eq!(got, Some(vec![1.3, 1.2, 0.0])); // [spatial, verbal, numeric]
+    }
+
+    #[test]
+    fn item_touching_untested_dimension_is_excluded_entirely_from_map() {
+        let got = project_item_from_map(
+            &map(&[("verbal", 1.1), ("reasoning", 1.4)]),
+            &strs(&TESTED),
+        );
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn empty_measured_map_is_vacuously_eligible_and_all_zero() {
+        let got = project_item_from_map(&map(&[]), &strs(&["verbal", "numeric"]));
+        assert_eq!(got, Some(vec![0.0, 0.0]));
     }
 }
